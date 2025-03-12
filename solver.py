@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import time
-from utils.utils import *
 from model.AnomalyTransformer import AnomalyTransformer
 from data_factory.data_loader import get_loader_segment
 from data_factory.battery_loader import get_battery_loader

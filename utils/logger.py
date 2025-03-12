@@ -4,11 +4,7 @@ import numpy as np
 import scipy.misc
 from datetime import datetime
 import os
-
-try:
-    from StringIO import StringIO  # Python 2.7
-except ImportError:
-    from io import BytesIO  # Python 3.5+
+from io import BytesIO  # Python 3.5+
 
 class Logger(object):
     def __init__(self, log_dir):
