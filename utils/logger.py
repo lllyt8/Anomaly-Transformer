@@ -1,72 +1,81 @@
-# Code referenced from https://gist.github.com/gyglim/1f8dfb1b5c82627ae3efcfbbadb9f514
+# 修改 utils/logger.py
 import tensorflow as tf
 import numpy as np
 import scipy.misc
+from datetime import datetime
+import os
 
 try:
     from StringIO import StringIO  # Python 2.7
 except ImportError:
     from io import BytesIO  # Python 3.5+
 
-
 class Logger(object):
-
     def __init__(self, log_dir):
         """Create a summary writer logging to log_dir."""
-        self.writer = tf.summary.FileWriter(log_dir)
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        # 创建TF2版本的writer
+        self.writer = tf.summary.create_file_writer(log_dir)
+        
+        # 保存log_dir以便在需要时使用
+        self.log_dir = log_dir
+        print(f"TensorBoard logging to: {log_dir}")
+        print("To view logs, run: tensorboard --logdir=" + log_dir)
 
     def scalar_summary(self, tag, value, step):
         """Log a scalar variable."""
-        summary = tf.Summary(value=[tf.Summary.Value(tag=tag, simple_value=value)])
-        self.writer.add_summary(summary, step)
+        with self.writer.as_default():
+            tf.summary.scalar(tag, value, step=step)
+            self.writer.flush()
 
     def image_summary(self, tag, images, step):
         """Log a list of images."""
-
-        img_summaries = []
-        for i, img in enumerate(images):
-            # Write the image to a string
-            try:
-                s = StringIO()
-            except:
-                s = BytesIO()
-            scipy.misc.toimage(img).save(s, format="png")
-
-            # Create an Image object
-            img_sum = tf.Summary.Image(encoded_image_string=s.getvalue(),
-                                       height=img.shape[0],
-                                       width=img.shape[1])
-            # Create a Summary value
-            img_summaries.append(tf.Summary.Value(tag='%s/%d' % (tag, i), image=img_sum))
-
-        # Create and write Summary
-        summary = tf.Summary(value=img_summaries)
-        self.writer.add_summary(summary, step)
+        with self.writer.as_default():
+            for i, img in enumerate(images):
+                # Convert image to proper format
+                if img.shape[-1] > 3:  # Check if extra channels
+                    img = img[:, :, :3]  # Keep only first 3 channels
+                
+                # Ensure image is float and normalized [0, 1]
+                if img.dtype != np.float32 and img.dtype != np.float64:
+                    img = img.astype(np.float32)
+                if img.max() > 1.0:
+                    img = img / 255.0
+                
+                # Make sure it has 3 dimensions with batch size 1
+                if len(img.shape) == 2:  # grayscale
+                    img = np.expand_dims(img, axis=2)
+                if img.shape[2] == 1:  # grayscale with channel dim
+                    img = np.repeat(img, 3, axis=2)
+                
+                # Add batch dimension if needed
+                if len(img.shape) == 3:
+                    img = np.expand_dims(img, axis=0)
+                
+                # Log the image
+                tf.summary.image(f"{tag}/{i}", img, step=step)
+            
+            self.writer.flush()
 
     def histo_summary(self, tag, values, step, bins=1000):
         """Log a histogram of the tensor of values."""
-
-        # Create a histogram using numpy
-        counts, bin_edges = np.histogram(values, bins=bins)
-
-        # Fill the fields of the histogram proto
-        hist = tf.HistogramProto()
-        hist.min = float(np.min(values))
-        hist.max = float(np.max(values))
-        hist.num = int(np.prod(values.shape))
-        hist.sum = float(np.sum(values))
-        hist.sum_squares = float(np.sum(values ** 2))
-
-        # Drop the start of the first bin
-        bin_edges = bin_edges[1:]
-
-        # Add bin edges and counts
-        for edge in bin_edges:
-            hist.bucket_limit.append(edge)
-        for c in counts:
-            hist.bucket.append(c)
-
-        # Create and write Summary
-        summary = tf.Summary(value=[tf.Summary.Value(tag=tag, histo=hist)])
-        self.writer.add_summary(summary, step)
-        self.writer.flush()
+        # Convert values to numpy if needed
+        if tf.is_tensor(values):
+            values = values.numpy()
+            
+        # Ensure values are flattened
+        values = values.flatten()
+        
+        # Fill in histogram
+        with self.writer.as_default():
+            tf.summary.histogram(tag, values, step=step, buckets=bins)
+            self.writer.flush()
+            
+            # Also log statistics as scalars for easier tracking
+            tf.summary.scalar(f"{tag}_mean", np.mean(values), step=step)
+            tf.summary.scalar(f"{tag}_std", np.std(values), step=step)
+            tf.summary.scalar(f"{tag}_min", np.min(values), step=step)
+            tf.summary.scalar(f"{tag}_max", np.max(values), step=step)
+            self.writer.flush()
