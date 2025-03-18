@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .attn import AnomalyAttention, AttentionLayer
-from .embed import DataEmbedding, TokenEmbedding
+from .embed import DataEmbedding
 
 
 class EncoderLayer(nn.Module):
