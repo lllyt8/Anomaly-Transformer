@@ -6,13 +6,15 @@ from utils.utils import *
 def main():
     parser = argparse.ArgumentParser()
     
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--num_epochs', type=int, default=10)
-    parser.add_argument('--k', type=int, default=3)
-    parser.add_argument('--win_size', type=int, default=100)
-    parser.add_argument('--input_c', type=int, default=12)  # 电池数据的特征数
-    parser.add_argument('--output_c', type=int, default=12) # 与input_c一致
-    parser.add_argument('--batch_size', type=int, default=64)  # 适用于CPU的批量大小
+    parser.add_argument('--lr', type=float, default=1e-4)  # Learning Rate
+    parser.add_argument('--num_epochs', type=int, default=10)  # Epochs
+    parser.add_argument('--d_model', type=int, default=512)  # Dimension of the model
+    parser.add_argument('--k', type=int, default=3)  # Number of attention heads
+    parser.add_argument('--win_size', type=int, default=100)  # Window size
+    parser.add_argument('--input_c', type=int, default=12)  # input dimension
+    parser.add_argument('--output_c', type=int, default=12)  # output dimension, same as input dimension
+    parser.add_argument('--batch_size', type=int, default=64)  # batch size for cpu training
+    # Save model Path
     parser.add_argument('--pretrained_model', type=str, default=None)
     parser.add_argument('--dataset', type=str, default='BATTERY')
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
