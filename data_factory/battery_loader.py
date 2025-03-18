@@ -11,28 +11,28 @@ class BatterySegLoader(object):
         self.step = step
         self.win_size = win_size
         
-        # 读取CSV数据
+        # Load data
         data = pd.read_csv(data_path)
         
-        # 确保数据按时间排序
+        # Sort data by timestamp
         if 'ts' in data.columns:
             data = data.sort_values('ts')
         
-        # 获取所有的stringId
+        # Obtain all unique stringId
         all_string_ids = data['stringId'].unique()
         if not silent:
-            print(f"发现 {len(all_string_ids)} 个不同的电池组(stringId)")
+            print(f"Found {len(all_string_ids)} different battery stringIds")
         
-        # 如果指定了target_string_id，只处理该电池组的数据
+        # We only process data for the current target_string_id
         if target_string_id is not None:
             if target_string_id in all_string_ids:
                 string_ids_to_process = [target_string_id]
                 if not silent:
-                    print(f"仅处理电池组 {target_string_id} 的数据")
+                    print(f"Only process String{target_string_id}'s data")
             else:
-                raise ValueError(f"指定的电池组ID {target_string_id} 不存在于数据中")
+                raise ValueError(f"The target_string_id {target_string_id} does not exist in the dataset.")
         else:
-            # 否则处理所有电池组
+            # Or handle all stringIds
             string_ids_to_process = all_string_ids
             if not silent:
                 print("处理所有电池组的数据")
@@ -149,7 +149,7 @@ class BatterySegLoader(object):
         else:
             return np.float32(self.all_data['test'][index]), np.float32(self.all_data['test_labels'][index])
 
-def get_battery_loader(data_path, batch_size, win_size=100, step=100, mode='train', target_string_id=None, silent=False):
+def get_battery_loader(data_path, batch_size, win_size=100, step=1, mode='train', target_string_id=None, silent=False):
     dataset = BatterySegLoader(data_path, win_size, step, mode, target_string_id, silent)
     
     shuffle = False
