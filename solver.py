@@ -5,7 +5,6 @@ import numpy as np
 import os
 import time
 from model.AnomalyTransformer import AnomalyTransformer
-from data_factory.data_loader import get_loader_segment
 from data_factory.battery_loader import get_battery_loader
 from utils.logger import Logger
 
@@ -67,7 +66,6 @@ class Solver(object):
     DEFAULTS = {}
 
     def __init__(self, config):
-
         self.__dict__.update(Solver.DEFAULTS, **config)
         
         # Create logs directory if it doesn't exist
@@ -77,32 +75,18 @@ class Solver(object):
         # Initialize TensorFlow logger
         self.logger = Logger('./logs/' + self.dataset)
 
-        if self.dataset == 'BATTERY':
-            # 获取target_string_id参数，如果不存在则默认为None
-            target_string_id = config.get('target_string_id', None)
-            
-            # Only the first loader prints info, others are silent
-            self.train_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                                   mode='train', target_string_id=target_string_id, silent=False)
-            self.vali_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                                  mode='val', target_string_id=target_string_id, silent=True)
-            self.test_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                                  mode='test', target_string_id=target_string_id, silent=True)
-            self.thre_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                                  mode='test', target_string_id=target_string_id, silent=True)
-        else:
-            self.train_loader = get_loader_segment(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                                  mode='train',
-                                                  dataset=self.dataset)
-            self.vali_loader = get_loader_segment(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                                 mode='val',
-                                                 dataset=self.dataset)
-            self.test_loader = get_loader_segment(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                                 mode='test',
-                                                 dataset=self.dataset)
-            self.thre_loader = get_loader_segment(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                                 mode='thre',
-                                                 dataset=self.dataset)
+        # 获取target_string_id参数，如果不存在则默认为None
+        target_string_id = config.get('target_string_id', None)
+        
+        # Only the first loader prints info, others are silent
+        self.train_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
+                                               mode='train', target_string_id=target_string_id, silent=False)
+        self.vali_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
+                                              mode='val', target_string_id=target_string_id, silent=True)
+        self.test_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
+                                              mode='test', target_string_id=target_string_id, silent=True)
+        self.thre_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
+                                              mode='test', target_string_id=target_string_id, silent=True)
 
         self.build_model()
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
