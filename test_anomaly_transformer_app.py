@@ -6,28 +6,393 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import time
+import json
+import requests
+from datetime import datetime
 from sklearn.metrics import precision_recall_fscore_support, roc_curve, auc, confusion_matrix
 from PIL import Image
 import io
 
-# 导入模型和数据加载器
-from model.AnomalyTransformer import AnomalyTransformer
-from data_factory.battery_loader import get_battery_loader, BatterySegLoader
-
-
 # 设置页面标题和配置
 st.set_page_config(page_title="Anomaly-Transformer Testing Tool", layout="wide")
 
+# BATTERY_FEATURE_RULES - 电池系统领域知识规则
+BATTERY_FEATURE_RULES = {
+    "systemVolt": "System voltage should remain within ±5% of nominal during normal operation. Rapid drops may indicate internal short circuits.",
+    "totalCurrentA": "Current fluctuations above 20% of normal operating levels may indicate load issues or battery degradation.",
+    "soc": "State of Charge should decrease gradually during discharge. Sudden drops indicate calculation errors or severe capacity loss.",
+    "soh": "State of Health below 80% indicates significant degradation. Rapid decreases are concerning.",
+    "hCellV": "Highest cell voltage should remain below upper limit (typically 4.2V for Li-ion). Values approaching this limit indicate overcharge risk.",
+    "lCellV": "Lowest cell voltage should stay above lower limit (typically 3.0V for Li-ion). Values approaching this indicate overdischarge risk.",
+    "CellVDelta": "Voltage difference between highest and lowest cells. Values above 100mV indicate cell imbalance issues.",
+    "hTempC": "Highest temperature should remain below 45°C for most battery types. Higher values indicate cooling issues or internal problems.",
+    "lTempC": "Lowest temperature affects charging capabilities. Below 0°C, charging should be limited or avoided for Li-ion batteries.",
+    "TempCDelta": "Temperature difference across the battery pack. Values above 5°C indicate airflow or cooling issues."
+}
+
+
 # KL散度损失计算
 def my_kl_loss(p, q):
-    """KL divergence loss calculation"""
+    """
+    计算KL散度
+    """
     res = p * (torch.log(p + 0.0001) - torch.log(q + 0.0001))
     return torch.mean(torch.sum(res, dim=-1), dim=1)
+
+
+class LLMAnomalyAnalyzer:
+    """Class to analyze anomalies using an LLM API (Deepseek or similar)"""
+    
+    def __init__(self, api_key=None, api_url=None):
+        """
+        Initialize the analyzer with API credentials
+        
+        Args:
+            api_key (str): API key for the LLM service
+            api_url (str): API endpoint URL
+        """
+        self.api_key = api_key
+        self.api_url = api_url or "https://api.deepseek.com/v1/chat/completions"  # Default URL
+    
+    def set_api_key(self, api_key):
+        """Set API key after initialization"""
+        self.api_key = api_key
+    
+    def set_api_url(self, api_url):
+        """Set API URL after initialization"""
+        self.api_url = api_url
+    
+    def extract_anomaly_context(self, results_df, device_data, threshold, window_size=100):
+        """
+        Extract context information for detected anomalies
+        
+        Args:
+            results_df (pd.DataFrame): DataFrame with anomaly detection results
+            device_data (dict): Dictionary with device data
+            threshold (float): Anomaly threshold value
+            window_size (int): Size of time windows
+            
+        Returns:
+            dict: Context information for LLM analysis
+        """
+        # Get anomaly samples
+        anomaly_df = results_df[results_df['Predicted_Label'] == 1].copy()
+        
+        if len(anomaly_df) == 0:
+            return {"status": "no_anomalies", "message": "No anomalies detected"}
+        
+        # Find the anomaly with highest score
+        max_anomaly = anomaly_df.loc[anomaly_df['Anomaly_Score'].idxmax()]
+        
+        # Get device ID if available
+        device_id = max_anomaly.get('Device_ID', 'unknown')
+        
+        # Get feature names
+        if 'device_data' in device_data and device_id in device_data.get('device_data', {}):
+            # This would require device_data to be passed from the data loader
+            feature_names = device_data.get('feature_names', ["Feature_" + str(i) for i in range(window_size)])
+        else:
+            feature_names = ["Feature_" + str(i) for i in range(window_size)]
+        
+        # Prepare context information
+        context = {
+            "status": "success",
+            "anomaly_info": {
+                "device_id": device_id,
+                "anomaly_score": float(max_anomaly['Anomaly_Score']),
+                "threshold": float(threshold),
+                "score_ratio": float(max_anomaly['Anomaly_Score'] / threshold),
+                "total_anomalies": len(anomaly_df),
+                "total_samples": len(results_df),
+                "anomaly_percentage": float(len(anomaly_df) / len(results_df) * 100)
+            },
+            "device_stats": {}
+        }
+        
+        # Add device-specific statistics if available
+        if 'Device_ID' in results_df.columns:
+            device_stats = results_df.groupby('Device_ID')['Predicted_Label'].agg(['count', 'sum'])
+            device_stats['anomaly_rate'] = device_stats['sum'] / device_stats['count'] * 100
+            
+            for idx, row in device_stats.iterrows():
+                context["device_stats"][str(idx)] = {
+                    "total_samples": int(row['count']),
+                    "anomaly_count": int(row['sum']),
+                    "anomaly_rate": float(row['anomaly_rate'])
+                }
+        
+        return context
+    
+    def analyze_anomalies(self, context, feature_rules=None):
+        """
+        Analyze anomalies using LLM API
+        
+        Args:
+            context (dict): Context information about the anomalies
+            feature_rules (dict, optional): Domain-specific rules for features
+            
+        Returns:
+            dict: Analysis results
+        """
+        if context.get("status") == "no_anomalies":
+            return {"status": "no_anomalies", "message": "No anomalies to analyze"}
+        
+        # Create prompt for LLM
+        prompt = self._create_analysis_prompt(context, feature_rules)
+        
+        # Check if API key is set
+        if not self.api_key:
+            return {
+                "status": "error", 
+                "message": "API key not set. Please provide an API key in the settings.",
+                "prompt": prompt  # Return prompt for debugging
+            }
+        
+        try:
+            # Call LLM API
+            response = self._call_llm_api(prompt)
+            
+            # Process response
+            analysis = self._process_llm_response(response)
+            analysis["prompt"] = prompt  # Include prompt for debugging
+            return analysis
+            
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Error calling LLM API: {str(e)}",
+                "prompt": prompt
+            }
+    
+    def _create_analysis_prompt(self, context, feature_rules=None):
+        """Create prompt for LLM analysis"""
+        anomaly_info = context["anomaly_info"]
+        device_stats = context["device_stats"]
+        
+        # Basic prompt
+        prompt = f"""You are an expert battery system analyst who specializes in anomaly detection and diagnosis. 
+I need your help to analyze some battery anomalies detected by a deep learning model.
+
+# Anomaly Detection Context:
+- Device ID with highest anomaly: {anomaly_info['device_id']}
+- Anomaly score: {anomaly_info['anomaly_score']:.4f} (threshold: {anomaly_info['threshold']:.4f})
+- Score ratio to threshold: {anomaly_info['score_ratio']:.2f}x
+- Total anomalies detected: {anomaly_info['total_anomalies']} out of {anomaly_info['total_samples']} samples ({anomaly_info['anomaly_percentage']:.2f}%)
+
+"""
+        
+        # Add device statistics if available
+        if device_stats:
+            prompt += "# Device-specific Statistics:\n"
+            for device_id, stats in device_stats.items():
+                prompt += f"- Device {device_id}: {stats['anomaly_count']} anomalies out of {stats['total_samples']} samples ({stats['anomaly_rate']:.2f}%)\n"
+            prompt += "\n"
+        
+        # Add feature rules if provided
+        if feature_rules:
+            prompt += "# Feature Domain Knowledge:\n"
+            for feature, rule in feature_rules.items():
+                prompt += f"- {feature}: {rule}\n"
+            prompt += "\n"
+        
+        # Analysis requests
+        prompt += """Based on this information, please provide:
+
+1. Potential causes of the anomalies (list at least 3 possibilities, ordered by likelihood)
+2. What type of anomaly pattern this likely represents (e.g., sudden spike, gradual drift, cyclical issue)
+3. Recommended next steps for investigation
+4. Potential mitigation measures
+
+Your response should be well-structured and written for a technical audience who manages battery systems. 
+Focus on actionable insights rather than just theoretical possibilities.
+"""
+        
+        return prompt
+    
+    def _call_llm_api(self, prompt):
+        """Call LLM API with the given prompt"""
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        
+        payload = {
+            "model": "deepseek-chat",  # or appropriate model name
+            "messages": [
+                {"role": "system", "content": "You are a battery system expert who specializes in anomaly analysis."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3,  # Lower temperature for more focused responses
+            "max_tokens": 1000
+        }
+        
+        response = requests.post(self.api_url, headers=headers, data=json.dumps(payload))
+        
+        if response.status_code != 200:
+            raise Exception(f"API request failed with status code {response.status_code}: {response.text}")
+        
+        return response.json()
+    
+    def _process_llm_response(self, response):
+        """Process the response from LLM API"""
+        try:
+            # Extract content from response (format depends on the API)
+            # This is for Deepseek API format, adjust if using a different LLM
+            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+            
+            if not content:
+                return {"status": "error", "message": "Empty response from LLM API"}
+            
+            return {
+                "status": "success",
+                "analysis": content,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+        except Exception as e:
+            return {"status": "error", "message": f"Error processing LLM response: {str(e)}"}
+
+
+def add_llm_analysis_to_streamlit(st, results_df, threshold, api_key=None):
+    """
+    Add LLM analysis section to Streamlit application
+    
+    Args:
+        st: Streamlit object
+        results_df (pd.DataFrame): DataFrame with anomaly detection results
+        threshold (float): Anomaly threshold value
+        api_key (str, optional): API key for LLM service
+    """
+    st.subheader("LLM-Powered Anomaly Analysis")
+    
+    # API key input
+    api_key_input = st.text_input("LLM API Key (Deepseek)", value=api_key or "", type="password")
+    
+    # Custom API URL (with default)
+    with st.expander("Advanced API Settings"):
+        api_url = st.text_input("API URL", value="https://api.deepseek.com/v1/chat/completions")
+    
+    # Initialize analyzer
+    analyzer = LLMAnomalyAnalyzer(api_key=api_key_input, api_url=api_url)
+    
+    # Extract context for analysis
+    device_data = {}  # Would be populated with actual data in real implementation
+    context = analyzer.extract_anomaly_context(results_df, device_data, threshold)
+    
+    # Display basic anomaly statistics
+    if context["status"] == "no_anomalies":
+        st.info("No anomalies detected. LLM analysis is not needed.")
+        return
+    
+    st.write("### Anomaly Summary")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Anomaly Score", f"{context['anomaly_info']['anomaly_score']:.4f}")
+    with col2:
+        st.metric("Threshold", f"{context['anomaly_info']['threshold']:.4f}")
+    with col3:
+        st.metric("Score Ratio", f"{context['anomaly_info']['score_ratio']:.2f}x")
+    
+    # Button to trigger LLM analysis
+    if st.button("Analyze with LLM"):
+        if not api_key_input:
+            st.warning("Please enter an API key to use LLM analysis.")
+        else:
+            with st.spinner("Analyzing anomalies with LLM..."):
+                analysis_result = analyzer.analyze_anomalies(context, BATTERY_FEATURE_RULES)
+                
+                if analysis_result["status"] == "success":
+                    st.write("### Expert Analysis")
+                    st.markdown(analysis_result["analysis"])
+                    
+                    # Save analysis option
+                    if st.button("Save Analysis to File"):
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = f"anomaly_analysis_{timestamp}.txt"
+                        with open(filename, "w") as f:
+                            f.write(f"Anomaly Analysis - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                            f.write(f"Device ID: {context['anomaly_info']['device_id']}\n")
+                            f.write(f"Anomaly Score: {context['anomaly_info']['anomaly_score']:.4f}\n")
+                            f.write(f"Threshold: {context['anomaly_info']['threshold']:.4f}\n\n")
+                            f.write(analysis_result["analysis"])
+                        
+                        st.success(f"Analysis saved to {filename}")
+                else:
+                    st.error(analysis_result["message"])
+                    
+                    # Show prompt for debugging
+                    with st.expander("Debug Information"):
+                        st.text(analysis_result.get("prompt", "Prompt not available"))
+    
+    # Display example analysis for demo purposes
+    with st.expander("Preview Example Analysis"):
+        st.markdown("""
+        ### Potential Causes of Anomalies
+
+        1. **Cell Imbalance** (Most Likely): The high anomaly score combined with the pattern across multiple devices suggests voltage imbalance between cells. This is typically caused by:
+           - Aging cells developing different internal resistance
+           - Manufacturing variations becoming more pronounced over time
+           - Thermal gradients within the battery pack
+
+        2. **Thermal Management Issues**: The anomaly patterns may indicate cooling system inefficiencies, particularly if:
+           - Temperature differentials exceed 5°C across the pack
+           - Higher anomaly rates occur during high-demand periods
+
+        3. **BMS Calibration Drift**: Battery Management System calibration may have drifted, causing:
+           - Inaccurate SOC calculations
+           - Improper cell balancing decisions
+           - Misreporting of actual battery conditions
+
+        ### Anomaly Pattern Analysis
+
+        This appears to represent a **gradual drift with periodic spikes** pattern. The baseline anomaly rate suggests underlying degradation, while the higher anomaly scores indicate specific triggering events (possibly high-current discharges or thermal events).
+
+        ### Recommended Investigation Steps
+
+        1. Examine cell voltage data during the highest anomaly score periods
+        2. Compare temperature distributions between normal and anomalous periods
+        3. Verify BMS calibration against direct measurements
+        4. Review usage patterns preceding anomalies
+        5. Check for correlation with environmental conditions (temperature, humidity)
+
+        ### Mitigation Measures
+
+        1. **Short-term**:
+           - Implement active cell balancing if not already present
+           - Reduce maximum discharge rates by 15-20%
+           - Increase cooling capacity during high-load operations
+
+        2. **Long-term**:
+           - Recalibrate BMS system
+           - Consider replacing highest-variance cells
+           - Update thermal management strategy
+           - Implement predictive maintenance based on anomaly patterns
+        """)
+
+
+# 导入必要的库，这些将在应用启动时导入
+def import_model_and_dataloader():
+    # 尝试导入模型和数据加载器，如果失败则显示错误
+    try:
+        from model.AnomalyTransformer import AnomalyTransformer
+        from data_factory.battery_loader import get_battery_loader, BatterySegLoader
+        return AnomalyTransformer, get_battery_loader
+    except ImportError as e:
+        st.error(f"Error importing model or data loader: {str(e)}")
+        st.info("Please ensure that the model and data_factory modules are in your PYTHONPATH.")
+        return None, None
+
 
 # 主函数
 def main():
     st.title("Anomaly-Transformer Testing Tool")
     st.write("This tool allows you to test the Anomaly-Transformer model on battery data.")
+    
+    # 导入模型和数据加载器
+    AnomalyTransformer, get_battery_loader = import_model_and_dataloader()
+    if AnomalyTransformer is None or get_battery_loader is None:
+        st.stop()
     
     # 创建侧边栏用于配置参数
     with st.sidebar:
@@ -45,12 +410,21 @@ def main():
         model_path = st.text_input("Model Path", value="checkpoints/BATTERY_checkpoint.pth")
         
         st.header("Optional Settings")
-        target_string_id = st.text_input("Target String ID (Optional)", value="")
-        if target_string_id == "":
-            target_string_id = None
+        target_id = st.text_input("Target ID (Optional)", value="")
+        if target_id == "":
+            target_id = None
+        
+        # LLM分析设置
+        st.header("LLM Analysis Settings")
+        enable_llm = st.checkbox("Enable LLM Analysis", value=True)
+        api_key = st.text_input("API Key (Deepseek)", type="password")
     
     # 预设你的数据路径
-    default_data_path = "/Users/orient/Documents/Projects/GitHub/Anomaly-Transformer/data_factory/raw/DanDLN_Data.csv"
+    default_data_path = st.text_input(
+        "Default Data Path", 
+        value="data/battery_data.csv",
+        help="Enter the default path to your battery data CSV file"
+    )
     
     # 文件选择部分 - 可以选择预设路径或上传文件
     st.header("Data Selection")
@@ -81,9 +455,25 @@ def main():
     
     # 显示数据预览
     if data_path:
-        df = pd.read_csv(data_path)
-        st.subheader("Data Preview")
-        st.dataframe(df.head())
+        try:
+            df = pd.read_csv(data_path)
+            st.subheader("Data Preview")
+            st.dataframe(df.head())
+            
+            # 创建特征选择（可选）
+            with st.expander("Feature Selection (Optional)"):
+                st.write("Select specific features to use. Leave blank to use default features.")
+                selected_features = st.multiselect(
+                    "Select features",
+                    options=df.columns.tolist(),
+                    default=[]
+                )
+                
+                # 如果用户没有选择特征，则使用None（让代码使用默认特征）
+                features_to_use = selected_features if selected_features else None
+        except Exception as e:
+            st.error(f"Error reading CSV file: {e}")
+            return
         
         # 选择设备
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -147,7 +537,8 @@ def main():
                         batch_size=batch_size, 
                         win_size=win_size,
                         mode='test', 
-                        target_string_id=target_string_id
+                        target_id=target_id,
+                        features=features_to_use
                     )
                     
                     # 也加载训练数据以计算阈值
@@ -156,11 +547,13 @@ def main():
                         batch_size=batch_size, 
                         win_size=win_size,
                         mode='train', 
-                        target_string_id=target_string_id,
-                        silent=True
+                        target_id=target_id,
+                        silent=True,
+                        features=features_to_use
                     )
                 except Exception as e:
                     st.error(f"Error loading data: {e}")
+                    st.error(f"Exception details: {str(e.__class__.__name__)}")
                     return
                 
                 # 步骤2: 计算训练集的能量分布(用于设置阈值)
@@ -171,7 +564,7 @@ def main():
                 criterion = torch.nn.MSELoss(reduce=False)
                 
                 try:
-                    for i, (input_data, _) in enumerate(train_loader):
+                    for i, input_data in enumerate(train_loader):
                         # 更新进度条，防止除以零错误
                         if len(train_loader) > 0:
                             progress_bar.progress(min(1.0, (i + 1) / len(train_loader)))
@@ -211,6 +604,7 @@ def main():
                             train_energy_scores.append(scores.detach().cpu().numpy())
                 except Exception as e:
                     st.error(f"Error during training energy computation: {e}")
+                    st.error(f"Exception details: {str(e.__class__.__name__)}")
                     return
                 
                 # 处理空结果的情况
@@ -226,14 +620,15 @@ def main():
                 
                 test_energy_scores = []
                 test_reconstruction_losses = []
-                test_labels = []
                 sample_indices = []
-                string_ids = []
+                device_ids = []  # 之前是string_ids
                 attention_maps = []
                 
                 try:
-                    for i, (input_data, labels) in enumerate(test_loader):
-                        # 更新进度条，防止除以零错误
+                    for i, input_data in enumerate(test_loader):
+                        actual_batch_size = input_data.size(0)  # 获取实际的批次大小
+                        
+                        # 更新进度条
                         if len(test_loader) > 0:
                             progress_bar.progress(min(1.0, (i + 1) / len(test_loader)))
                         
@@ -280,187 +675,93 @@ def main():
                             scores = metric * rec_loss
                             test_energy_scores.append(scores.detach().cpu().numpy())
                             
-                            # 保存标签
-                            test_labels.append(labels.numpy())
-                            
-                            # 保存样本索引
-                            batch_indices = list(range(i * batch_size, (i + 1) * batch_size))
-                            batch_indices = batch_indices[:len(input_data)]  # 处理最后一个批次
+                            # 保存样本索引时使用实际批次大小
+                            batch_indices = list(range(
+                                i * batch_size, 
+                                min(i * batch_size + actual_batch_size, len(test_loader.dataset))
+                            ))
                             sample_indices.extend(batch_indices)
                             
-                            # 如果数据加载器提供了电池组ID，则记录它们
-                            if hasattr(test_loader.dataset, 'all_data') and 'test_string_ids' in test_loader.dataset.all_data:
-                                for idx in batch_indices:
-                                    if idx < len(test_loader.dataset.all_data['test_string_ids']):
-                                        string_ids.append(test_loader.dataset.all_data['test_string_ids'][idx])
+                            # 处理设备ID时也使用实际批次大小
+                            if hasattr(test_loader.dataset, 'device_ids'):
+                                device_ids.extend([
+                                    test_loader.dataset.device_ids[idx] 
+                                    for idx in batch_indices[:actual_batch_size]
+                                ])
+
+                    # 处理收集到的数据
+                    test_energy_scores = np.concatenate(test_energy_scores, axis=0).reshape(-1)
+                    test_reconstruction_losses = np.concatenate(test_reconstruction_losses, axis=0).reshape(-1)
+                    
+                    # 计算阈值（使用训练集能量分布的百分位数）
+                    threshold = np.percentile(train_energy_scores, (1 - anomaly_ratio) * 100)
+                    
+                    # 生成预测标签
+                    predictions = (test_energy_scores > threshold).astype(int)
+                    
+                    # 记录实际处理的数据长度
+                    actual_processed_length = len(test_loader.dataset)
+
+                    # 显示调试信息
+                    st.write("数据长度检查:")
+                    st.write(f"test_energy_scores 长度: {len(test_energy_scores)}")
+                    st.write(f"sample_indices 长度: {len(sample_indices)}")
+                    st.write(f"test_reconstruction_losses 长度: {len(test_reconstruction_losses)}")
+                    st.write(f"predictions 长度: {len(predictions)}")
+                    if device_ids:
+                        st.write(f"device_ids 长度: {len(device_ids)}")
+                    
+                    # 确保所有数组使用相同的长度
+                    results_data = {
+                        'Sample_Index': sample_indices[:actual_processed_length],
+                        'Anomaly_Score': test_energy_scores[:actual_processed_length],
+                        'Reconstruction_Loss': test_reconstruction_losses[:actual_processed_length],
+                        'Predicted_Label': predictions[:actual_processed_length]
+                    }
+                    
+                    # 如果有设备ID，添加到结果中
+                    if device_ids:
+                        device_ids_processed = device_ids[:actual_processed_length]
+                        if len(device_ids_processed) < actual_processed_length:
+                            device_ids_processed.extend([None] * (actual_processed_length - len(device_ids_processed)))
+                        results_data['Device_ID'] = device_ids_processed
+                    
+                    # 创建DataFrame
+                    results_df = pd.DataFrame(results_data)
+                    
+                    # 显示结果统计
+                    st.write("### 检测结果统计")
+                    st.write(f"总样本数: {len(results_df)}")
+                    st.write(f"检测到的异常数: {results_df['Predicted_Label'].sum()}")
+                    st.write(f"异常比例: {results_df['Predicted_Label'].mean():.2%}")
+                    st.write(f"阈值: {threshold:.4f}")
+                    
+                    # 显示异常分数分布图
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    sns.histplot(data=results_df, x='Anomaly_Score', hue='Predicted_Label', bins=50)
+                    plt.axvline(x=threshold, color='r', linestyle='--', label='Threshold')
+                    plt.legend()
+                    st.pyplot(fig)
+                    
+                    # 显示注意力图
+                    if attention_maps:
+                        st.write("### 注意力图可视化")
+                        cols = st.columns(len(attention_maps))
+                        for (title, attn_map), col in zip(attention_maps, cols):
+                            fig, ax = plt.subplots(figsize=(6, 6))
+                            sns.heatmap(attn_map, ax=ax)
+                            ax.set_title(title)
+                            col.pyplot(fig)
+                    
+                    # 如果启用了LLM分析
+                    if enable_llm:
+                        add_llm_analysis_to_streamlit(st, results_df, threshold, api_key)
+
                 except Exception as e:
-                    st.error(f"Error during test evaluation: {e}")
-                    return
-                
-                # 处理空结果的情况
-                if len(test_energy_scores) == 0:
-                    st.error("No test data available for processing.")
-                    return
-                
-                test_energy_scores = np.concatenate(test_energy_scores, axis=0).reshape(-1)
-                test_reconstruction_losses = np.concatenate(test_reconstruction_losses, axis=0).reshape(-1)
-                if len(test_labels) > 0:
-                    test_labels = np.concatenate(test_labels, axis=0).reshape(-1)
-                
-                # 步骤4: 计算阈值并生成预测结果
-                combined_scores = np.concatenate([train_energy_scores, test_energy_scores])
-                threshold = np.percentile(combined_scores, 100 - anomaly_ratio)
-                
-                predictions = (test_energy_scores > threshold).astype(int)
-                
-                # 修复：确定所有列的最小长度，避免不同长度的数组
-                min_length = min(
-                    len(sample_indices),
-                    len(test_energy_scores),
-                    len(test_reconstruction_losses),
-                    len(predictions)
-                )
-                
-                # 创建结果DataFrame，确保所有数组使用相同的长度
-                results_data = {
-                    'Sample_Index': sample_indices[:min_length],
-                    'Anomaly_Score': test_energy_scores[:min_length],
-                    'Reconstruction_Loss': test_reconstruction_losses[:min_length],
-                    'Predicted_Label': predictions[:min_length]
-                }
-                
-                # 对其他可选列进行同样的处理
-                if string_ids:
-                    if len(string_ids) >= min_length:
-                        results_data['String_ID'] = string_ids[:min_length]
-                    else:
-                        # 如果string_ids长度不够，用None填充
-                        results_data['String_ID'] = string_ids + [None] * (min_length - len(string_ids))
-                
-                if len(test_labels) > 0:
-                    if len(test_labels) >= min_length:
-                        results_data['True_Label'] = test_labels[:min_length]
-                    else:
-                        # 如果test_labels长度不够，用0填充
-                        results_data['True_Label'] = np.concatenate([test_labels, np.zeros(min_length - len(test_labels))])
-                
-                # 现在所有列都有相同的长度，可以安全创建DataFrame
-                results_df = pd.DataFrame(results_data)
-            
-            # 显示测试结果
-            st.subheader("Test Results")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.write(f"Anomaly threshold: {threshold:.6f}")
-                st.write(f"Total samples tested: {len(results_df)}")
-                anomaly_count = results_df['Predicted_Label'].sum()
-                st.write(f"Detected anomalies: {anomaly_count} ({anomaly_count/len(results_df)*100:.2f}%)")
-            
-            with col2:
-                st.write(f"Average anomaly score: {results_df['Anomaly_Score'].mean():.6f}")
-                st.write(f"Max anomaly score: {results_df['Anomaly_Score'].max():.6f}")
-                st.write(f"Min anomaly score: {results_df['Anomaly_Score'].min():.6f}")
-            
-            # 显示性能指标(如果有真实标签)
-            if 'True_Label' in results_df.columns and np.sum(results_df['True_Label']) > 0:
-                st.subheader("Performance Metrics")
-                precision, recall, f1, _ = precision_recall_fscore_support(
-                    results_df['True_Label'], results_df['Predicted_Label'], average='binary')
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Precision", f"{precision:.4f}")
-                with col2:
-                    st.metric("Recall", f"{recall:.4f}")
-                with col3:
-                    st.metric("F1 Score", f"{f1:.4f}")
-                
-                # 混淆矩阵
-                cm = confusion_matrix(results_df['True_Label'], results_df['Predicted_Label'])
-                st.write("Confusion Matrix:")
-                
-                fig, ax = plt.subplots(figsize=(4, 3))
-                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
-                ax.set_xlabel('Predicted Label')
-                ax.set_ylabel('True Label')
-                ax.set_title('Confusion Matrix')
-                st.pyplot(fig)
-                
-                # ROC曲线
-                fpr, tpr, _ = roc_curve(results_df['True_Label'], results_df['Anomaly_Score'])
-                roc_auc = auc(fpr, tpr)
-                
-                fig, ax = plt.subplots(figsize=(4, 3))
-                ax.plot(fpr, tpr, label=f'AUC = {roc_auc:.3f}')
-                ax.plot([0, 1], [0, 1], 'k--')
-                ax.set_xlabel('False Positive Rate')
-                ax.set_ylabel('True Positive Rate')
-                ax.set_title('ROC Curve')
-                ax.legend(loc='lower right')
-                st.pyplot(fig)
-            
-            # 显示所有结果
-            st.subheader("All Test Samples")
-            st.dataframe(results_df)
-            
-            # 只显示异常样本
-            st.subheader("Anomaly Samples")
-            anomaly_df = results_df[results_df['Predicted_Label'] == 1]
-            st.dataframe(anomaly_df)
-            
-            # 可视化
-            st.subheader("Visualizations")
-            
-            # 异常分数分布
-            fig, ax = plt.subplots(figsize=(10, 4))
-            sns.histplot(results_df['Anomaly_Score'], kde=True, ax=ax)
-            ax.axvline(threshold, color='r', linestyle='--', label='Threshold')
-            ax.set_title('Anomaly Score Distribution')
-            ax.set_xlabel('Anomaly Score')
-            ax.set_ylabel('Count')
-            ax.legend()
-            st.pyplot(fig)
-            
-            # 异常分数时间序列
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(results_df['Sample_Index'], results_df['Anomaly_Score'])
-            ax.axhline(threshold, color='r', linestyle='--', label='Threshold')
-            ax.set_title('Anomaly Score over Samples')
-            ax.set_xlabel('Sample Index')
-            ax.set_ylabel('Anomaly Score')
-            ax.legend()
-            st.pyplot(fig)
-            
-            # 重构损失时间序列
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(results_df['Sample_Index'], results_df['Reconstruction_Loss'])
-            ax.set_title('Reconstruction Loss over Samples')
-            ax.set_xlabel('Sample Index')
-            ax.set_ylabel('Reconstruction Loss')
-            st.pyplot(fig)
-            
-            # 显示注意力图
-            if len(attention_maps) > 0:
-                st.subheader("Attention Maps")
-                cols = st.columns(min(3, len(attention_maps)))
-                
-                for i, (layer_name, attn_map) in enumerate(attention_maps):
-                    with cols[i % len(cols)]:
-                        fig, ax = plt.subplots(figsize=(5, 5))
-                        im = ax.imshow(attn_map, cmap='viridis')
-                        ax.set_title(f'Attention Map - {layer_name}')
-                        fig.colorbar(im, ax=ax)
-                        st.pyplot(fig)
-            
-            # 提供下载结果的选项
-            csv = results_df.to_csv(index=False)
-            st.download_button(
-                label="Download Results as CSV",
-                data=csv,
-                file_name="anomaly_detection_results.csv",
-                mime="text/csv"
-            )
+                    st.error(f"测试过程中发生错误: {str(e)}")
+                    st.error(f"错误详情: {str(e.__class__.__name__)}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
 if __name__ == "__main__":
     main()

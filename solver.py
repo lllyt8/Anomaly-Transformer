@@ -7,6 +7,7 @@ import time
 from model.AnomalyTransformer import AnomalyTransformer
 from data_factory.battery_loader import get_battery_loader
 from utils.logger import Logger
+from tqdm import tqdm
 
 
 def my_kl_loss(p, q):
@@ -22,7 +23,7 @@ def adjust_learning_rate(optimizer, epoch, lr_):
             param_group['lr'] = lr
         print('Updating learning rate to {}'.format(lr))
 
-
+# Early stopping Machanism
 class EarlyStopping:
     def __init__(self, patience=7, verbose=False, dataset_name='', delta=0):
         self.patience = patience
@@ -57,15 +58,32 @@ class EarlyStopping:
     def save_checkpoint(self, val_loss, val_loss2, model, path):
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
-        torch.save(model.state_dict(), os.path.join(path, str(self.dataset) + '_checkpoint.pth'))
-        self.val_loss_min = val_loss
-        self.val_loss2_min = val_loss2
+        
+        # 确保目录存在
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        # 保存模型
+        try:
+            torch.save(model.state_dict(), path)
+            self.val_loss_min = val_loss
+            self.val_loss2_min = val_loss2
+        except Exception as e:
+            print(f"Error saving model to {path}: {e}")
+            # 尝试使用临时目录
+            temp_path = os.path.join(os.path.expanduser("~"), "temp_models")
+            os.makedirs(temp_path, exist_ok=True)
+            backup_path = os.path.join(temp_path, str(self.dataset) + '_checkpoint.pth')
+            print(f"Attempting to save to backup location: {backup_path}")
+            torch.save(model.state_dict(), backup_path)
 
 
 class Solver(object):
     DEFAULTS = {}
 
     def __init__(self, config):
+        # 设置默认值
+        self.k = config.get('k', 3.0)  # 如果没有提供k，默认值为3.0
+        
         self.__dict__.update(Solver.DEFAULTS, **config)
         
         # Create logs directory if it doesn't exist
@@ -75,18 +93,45 @@ class Solver(object):
         # Initialize TensorFlow logger
         self.logger = Logger('./logs/' + self.dataset)
 
-        # 获取target_string_id参数，如果不存在则默认为None
-        target_string_id = config.get('target_string_id', None)
+        # 获取target_id参数，如果不存在则默认为None
+        target_id = config.get('target_id', None)  # 改为 target_id
         
         # Only the first loader prints info, others are silent
-        self.train_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                               mode='train', target_string_id=target_string_id, silent=False)
-        self.vali_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                              mode='val', target_string_id=target_string_id, silent=True)
-        self.test_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                              mode='test', target_string_id=target_string_id, silent=True)
-        self.thre_loader = get_battery_loader(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                              mode='test', target_string_id=target_string_id, silent=True)
+        self.train_loader = get_battery_loader(
+            self.data_path, 
+            batch_size=self.batch_size, 
+            win_size=self.win_size,
+            mode='train', 
+            target_id=target_id,  # 改为 target_id
+            silent=False
+        )
+        
+        self.vali_loader = get_battery_loader(
+            self.data_path, 
+            batch_size=self.batch_size, 
+            win_size=self.win_size,
+            mode='val', 
+            target_id=target_id,  # 改为 target_id
+            silent=True
+        )
+        
+        self.test_loader = get_battery_loader(
+            self.data_path, 
+            batch_size=self.batch_size, 
+            win_size=self.win_size,
+            mode='test', 
+            target_id=target_id,  # 改为 target_id
+            silent=True
+        )
+        
+        self.thre_loader = get_battery_loader(
+            self.data_path, 
+            batch_size=self.batch_size, 
+            win_size=self.win_size,
+            mode='test', 
+            target_id=target_id,  # 改为 target_id
+            silent=True
+        )
 
         self.build_model()
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -104,10 +149,11 @@ class Solver(object):
 
     def vali(self, vali_loader):
         self.model.eval()
-
         loss_1 = []
         loss_2 = []
-        for i, (input_data, _) in enumerate(vali_loader):
+        for i, input_data in enumerate(vali_loader):
+            if isinstance(input_data, (list, tuple)):
+                input_data = input_data[0]  # Handle case where loader returns tuple
             input = input_data.float().to(self.device)
             output, series, prior, _ = self.model(input)
             series_loss = 0.0
@@ -137,119 +183,141 @@ class Solver(object):
         return np.average(loss_1), np.average(loss_2)
 
     def train(self):
-
         print("======================TRAIN MODE======================")
-
-        time_now = time.time()
-        path = self.model_save_path
-        if not os.path.exists(path):
-            os.makedirs(path)
-        early_stopping = EarlyStopping(patience=3, verbose=True, dataset_name=self.dataset)
-        train_steps = len(self.train_loader)
         
-        # Global step for logging
-        global_step = 0
-
+        # 确保模型保存目录存在
+        os.makedirs(self.model_save_path, exist_ok=True)
+        path = os.path.join(self.model_save_path, f"{self.dataset}_checkpoint.pth")
+        
+        print(f"Model will be saved to: {path}")
+        
+        # 检查目录是否可写
+        if not os.access(os.path.dirname(path), os.W_OK):
+            print(f"Warning: No write permission for {self.model_save_path}")
+            # 使用临时目录
+            temp_path = os.path.join(os.path.expanduser("~"), "temp_models")
+            os.makedirs(temp_path, exist_ok=True)
+            path = os.path.join(temp_path, f"{self.dataset}_checkpoint.pth")
+            print(f"Using alternative save location: {path}")
+        
+        time_now = time.time()
+        global_step = 0  # 初始化 global_step
+        
+        train_steps = len(self.train_loader)
+        early_stopping = EarlyStopping(patience=3, verbose=True)
+        
         for epoch in range(self.num_epochs):
             iter_count = 0
-            loss1_list = []
-
-            epoch_time = time.time()
+            loss_list = []
+            
             self.model.train()
-            for i, (input_data, labels) in enumerate(self.train_loader):
-
-                self.optimizer.zero_grad()
+            epoch_time = time.time()
+            
+            pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.num_epochs}')
+            for i, input_data in enumerate(pbar):
                 iter_count += 1
+                self.optimizer.zero_grad()
+                
+                # 处理输入数据
                 input = input_data.float().to(self.device)
-
                 output, series, prior, _ = self.model(input)
-
-                # calculate Association discrepancy
+                
+                # 计算重构损失
+                rec_loss = torch.mean(self.criterion(output, input))  # 确保得到标量
+                
+                # 计算系列损失
                 series_loss = 0.0
                 prior_loss = 0.0
+                
                 for u in range(len(prior)):
-                    series_loss += (torch.mean(my_kl_loss(series[u], (
-                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach())) + torch.mean(
-                        my_kl_loss((prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                           self.win_size)).detach(),
-                                   series[u])))
-                    prior_loss += (torch.mean(my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                        series[u].detach())) + torch.mean(
-                        my_kl_loss(series[u].detach(), (
-                                prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                       self.win_size)))))
+                    if u == 0:
+                        series_loss = torch.mean(my_kl_loss(series[u], (
+                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, self.win_size)
+                        ).detach()))
+                        prior_loss = torch.mean(my_kl_loss(
+                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, self.win_size)),
+                            series[u].detach()
+                        ))
+                    else:
+                        series_loss += torch.mean(my_kl_loss(series[u], (
+                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, self.win_size)
+                        ).detach()))
+                        prior_loss += torch.mean(my_kl_loss(
+                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, self.win_size)),
+                            series[u].detach()
+                        ))
+                
                 series_loss = series_loss / len(prior)
                 prior_loss = prior_loss / len(prior)
-
-                rec_loss = self.criterion(output, input)
-
-                loss1_list.append((rec_loss - self.k * series_loss).item())
+                
+                # 计算总损失
                 loss1 = rec_loss - self.k * series_loss
                 loss2 = rec_loss + self.k * prior_loss
                 
-                # Increment global step counter
-                global_step += 1
+                loss_list.append(loss1.item())  # 现在应该可以正确转换为标量了
                 
-                # Log metrics every 10 iterations
+                # 记录训练指标
                 if (i + 1) % 10 == 0:
                     self.logger.scalar_summary('train_loss', loss1.item(), global_step)
                     self.logger.scalar_summary('reconstruction_loss', rec_loss.item(), global_step)
                     self.logger.scalar_summary('series_loss', series_loss.item(), global_step)
                     self.logger.scalar_summary('prior_loss', prior_loss.item(), global_step)
-                    
-                # Log attention map visualization every 100 iterations
-                if (i + 1) % 100 == 0:
-                    try:
-                        # Get the first attention map from the batch
-                        if len(series) > 0 and series[0].shape[0] > 0:
-                            # Take the first head from the first sample
-                            attn_map = series[0][0, 0].detach().cpu().numpy()
-                            # Convert to image format (H×W×C)
-                            attn_img = np.expand_dims(attn_map, axis=2)
-                            # Normalize for visualization
-                            attn_img = (attn_img - attn_img.min()) / (attn_img.max() - attn_img.min() + 1e-6)
-                            # Log as image
-                            self.logger.image_summary('attention_map', [attn_img], global_step)
-                    except Exception as e:
-                        print(f"Error logging attention map: {e}")
-
+                
+                # 更新进度条描述
+                pbar.set_postfix({
+                    'loss': f'{loss1.item():.4f}',
+                    'rec_loss': f'{rec_loss.item():.4f}'
+                })
+                
+                # 更新进度信息
                 if (i + 1) % 100 == 0:
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.num_epochs - epoch) * train_steps - i)
                     print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
                     iter_count = 0
                     time_now = time.time()
-
-                # Minimax strategy
+                
+                # 反向传播和优化
                 loss1.backward(retain_graph=True)
                 loss2.backward()
                 self.optimizer.step()
-
+                
+                global_step += 1  # 更新全局步数
+            
+            # 每个epoch结束后的处理
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
-            train_loss = np.average(loss1_list)
-
+            train_loss = np.average(loss_list)
+            
             vali_loss1, vali_loss2 = self.vali(self.test_loader)
             
-            # Log validation metrics
+            # 记录验证指标
             self.logger.scalar_summary('validation_loss1', vali_loss1, global_step)
             self.logger.scalar_summary('validation_loss2', vali_loss2, global_step)
-
-            print(
-                "Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} ".format(
-                    epoch + 1, train_steps, train_loss, vali_loss1))
+            
+            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} ".format(
+                epoch + 1, train_steps, train_loss, vali_loss1))
+            
+            # 早停检查
             early_stopping(vali_loss1, vali_loss2, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
+                
+            # 学习率调整
             adjust_learning_rate(self.optimizer, epoch + 1, self.lr)
+        
+        # 保存最终模型
+        final_model_path = os.path.join(self.model_save_path, f"{self.dataset}_checkpoint.pth")
+        torch.save(self.model.state_dict(), final_model_path)
+        print(f"Final model saved to {final_model_path}")
 
     def test(self):
-        self.model.load_state_dict(
-            torch.load(
-                os.path.join(str(self.model_save_path), str(self.dataset) + '_checkpoint.pth'), map_location=self.device))
+        model_path = os.path.join(self.model_save_path, f"{self.dataset}_checkpoint.pth")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found at {model_path}. Please train the model first.")
+        
+        print(f"Loading model from {model_path}")
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
         temperature = 50
 
