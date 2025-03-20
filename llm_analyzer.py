@@ -17,7 +17,7 @@ class LLMAnomalyAnalyzer:
             api_url (str): API endpoint URL
         """
         self.api_key = api_key
-        self.api_url = api_url or "https://api.deepseek.com/v1/chat/completions"  # Default URL
+        self.api_url = api_url or "https://api.deepseek.com/v1/"  # Default URL
     
     def set_api_key(self, api_key):
         """Set API key after initialization"""
