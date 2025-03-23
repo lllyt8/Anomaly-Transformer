@@ -9,6 +9,7 @@ import time
 import json
 import requests
 from datetime import datetime
+from sklearn.preprocessing import StandardScaler  
 from sklearn.metrics import precision_recall_fscore_support, roc_curve, auc, confusion_matrix
 from PIL import Image
 import io
@@ -52,7 +53,7 @@ class LLMAnomalyAnalyzer:
             api_url (str): API endpoint URL
         """
         self.api_key = api_key
-        self.api_url = api_url or "https://api.deepseek.com/v1/chat/completions"  # Default URL
+        self.api_url = api_url or "https://api.deepseek.com/v1/"  # Default URL
     
     def set_api_key(self, api_key):
         """Set API key after initialization"""
@@ -635,133 +636,254 @@ def main():
                         input_data = input_data.float().to(device)
                         
                         with torch.no_grad():
-                            output, series, prior, _ = model(input_data)
+                            output, series, prior, sigmas = model(input_data)
                             
-                            # 保存第一个批次的注意力图
+                            # Debug information for first batch
                             if i == 0:
-                                for layer_idx, s in enumerate(series):
+                                st.write(f"Batch shapes: input={input_data.shape}, output={output.shape}")
+                                st.write(f"Series list length: {len(series)}, Prior list length: {len(prior)}")
+                                
+                                # Collect attention maps and sigma statistics
+                                attention_maps = []
+                                for layer_idx, (s, sigma) in enumerate(zip(series, sigmas)):
                                     if s.shape[0] > 0:
-                                        # 获取第一个样本的注意力图
+                                        # Save attention map
                                         attn_map = s[0, 0].detach().cpu().numpy()
                                         attention_maps.append((f"Layer {layer_idx+1}", attn_map))
-                            
-                            # 计算重构损失
-                            rec_loss = torch.mean(criterion(input_data, output), dim=-1)
-                            test_reconstruction_losses.append(rec_loss.detach().cpu().numpy())
-                            
-                            # 计算系列损失和先验损失
-                            series_loss = 0.0
-                            prior_loss = 0.0
-                            for u in range(len(prior)):
-                                if u == 0:
-                                    series_loss = my_kl_loss(series[u], (
-                                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                                  win_size)).detach()) * temperature
-                                    prior_loss = my_kl_loss(
-                                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                                win_size)),
-                                        series[u].detach()) * temperature
-                                else:
-                                    series_loss += my_kl_loss(series[u], (
-                                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                                  win_size)).detach()) * temperature
-                                    prior_loss += my_kl_loss(
-                                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                                win_size)),
-                                        series[u].detach()) * temperature
-                            
-                            # 计算异常分数
-                            metric = torch.softmax((-series_loss - prior_loss), dim=-1)
-                            scores = metric * rec_loss
-                            test_energy_scores.append(scores.detach().cpu().numpy())
-                            
-                            # 保存样本索引时使用实际批次大小
-                            batch_indices = list(range(
-                                i * batch_size, 
-                                min(i * batch_size + actual_batch_size, len(test_loader.dataset))
-                            ))
-                            sample_indices.extend(batch_indices)
-                            
-                            # 处理设备ID时也使用实际批次大小
-                            if hasattr(test_loader.dataset, 'device_ids'):
-                                device_ids.extend([
-                                    test_loader.dataset.device_ids[idx] 
-                                    for idx in batch_indices[:actual_batch_size]
-                                ])
-
-                    # 处理收集到的数据
-                    test_energy_scores = np.concatenate(test_energy_scores, axis=0).reshape(-1)
-                    test_reconstruction_losses = np.concatenate(test_reconstruction_losses, axis=0).reshape(-1)
-                    
-                    # 计算阈值（使用训练集能量分布的百分位数）
-                    threshold = np.percentile(train_energy_scores, (1 - anomaly_ratio) * 100)
-                    
-                    # 生成预测标签
-                    predictions = (test_energy_scores > threshold).astype(int)
-                    
-                    # 记录实际处理的数据长度
-                    actual_processed_length = len(test_loader.dataset)
-
-                    # 显示调试信息
-                    st.write("数据长度检查:")
-                    st.write(f"test_energy_scores 长度: {len(test_energy_scores)}")
-                    st.write(f"sample_indices 长度: {len(sample_indices)}")
-                    st.write(f"test_reconstruction_losses 长度: {len(test_reconstruction_losses)}")
-                    st.write(f"predictions 长度: {len(predictions)}")
-                    if device_ids:
-                        st.write(f"device_ids 长度: {len(device_ids)}")
-                    
-                    # 确保所有数组使用相同的长度
-                    results_data = {
-                        'Sample_Index': sample_indices[:actual_processed_length],
-                        'Anomaly_Score': test_energy_scores[:actual_processed_length],
-                        'Reconstruction_Loss': test_reconstruction_losses[:actual_processed_length],
-                        'Predicted_Label': predictions[:actual_processed_length]
-                    }
-                    
-                    # 如果有设备ID，添加到结果中
-                    if device_ids:
-                        device_ids_processed = device_ids[:actual_processed_length]
-                        if len(device_ids_processed) < actual_processed_length:
-                            device_ids_processed.extend([None] * (actual_processed_length - len(device_ids_processed)))
-                        results_data['Device_ID'] = device_ids_processed
-                    
-                    # 创建DataFrame
-                    results_df = pd.DataFrame(results_data)
-                    
-                    # 显示结果统计
-                    st.write("### 检测结果统计")
-                    st.write(f"总样本数: {len(results_df)}")
-                    st.write(f"检测到的异常数: {results_df['Predicted_Label'].sum()}")
-                    st.write(f"异常比例: {results_df['Predicted_Label'].mean():.2%}")
-                    st.write(f"阈值: {threshold:.4f}")
-                    
-                    # 显示异常分数分布图
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    sns.histplot(data=results_df, x='Anomaly_Score', hue='Predicted_Label', bins=50)
-                    plt.axvline(x=threshold, color='r', linestyle='--', label='Threshold')
-                    plt.legend()
-                    st.pyplot(fig)
-                    
-                    # 显示注意力图
-                    if attention_maps:
-                        st.write("### 注意力图可视化")
-                        cols = st.columns(len(attention_maps))
-                        for (title, attn_map), col in zip(attention_maps, cols):
-                            fig, ax = plt.subplots(figsize=(6, 6))
-                            sns.heatmap(attn_map, ax=ax)
-                            ax.set_title(title)
-                            col.pyplot(fig)
-                    
-                    # 如果启用了LLM分析
-                    if enable_llm:
-                        add_llm_analysis_to_streamlit(st, results_df, threshold, api_key)
+                                        
+                                        # Log layer statistics
+                                        sigma_stats = sigma[0].detach().cpu().numpy()
+                                        st.write(f"Layer {layer_idx+1} stats:")
+                                        st.write(f"- Attention: min={attn_map.min():.4f}, max={attn_map.max():.4f}, mean={attn_map.mean():.4f}")
+                                        st.write(f"- Sigma: min={sigma_stats.min():.4f}, max={sigma_stats.max():.4f}, mean={sigma_stats.mean():.4f}")
+                        
+                        # Calculate reconstruction loss
+                        rec_loss = torch.mean(criterion(input_data, output), dim=-1)
+                        test_reconstruction_losses.append(rec_loss.detach().cpu().numpy())
+                        
+                        # Calculate series and prior losses
+                        series_loss = 0.0
+                        prior_loss = 0.0
+                        for u in range(len(prior)):
+                            if u == 0:
+                                series_loss = my_kl_loss(series[u], (
+                                    prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, win_size)).detach())
+                                prior_loss = my_kl_loss(
+                                    (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, win_size)),
+                                    series[u].detach())
+                            else:
+                                series_loss += my_kl_loss(series[u], (
+                                    prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, win_size)).detach())
+                                prior_loss += my_kl_loss(
+                                    (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, win_size)),
+                                    series[u].detach())
+                        
+                        # Calculate anomaly scores
+                        metric = torch.softmax((-series_loss - prior_loss), dim=-1)
+                        scores = metric * rec_loss
+                        test_energy_scores.append(scores.detach().cpu().numpy())
+                        
+                        # Generate correct sample indices
+                        start_idx = i * batch_size
+                        end_idx = min(start_idx + actual_batch_size, len(test_loader.dataset))
+                        batch_indices = list(range(start_idx, end_idx))
+                        sample_indices.extend(batch_indices)
+                        
+                        # Handle device IDs if available
+                        if hasattr(test_loader.dataset, 'device_ids'):
+                            device_ids.extend([test_loader.dataset.device_ids[idx] for idx in batch_indices[:actual_batch_size]])
 
                 except Exception as e:
-                    st.error(f"测试过程中发生错误: {str(e)}")
-                    st.error(f"错误详情: {str(e.__class__.__name__)}")
-                    import traceback
-                    st.code(traceback.format_exc())
+                    st.error(f"Error during testing: {e}")
+                    st.error(f"Exception details: {str(e.__class__.__name__)}")
+                    return
+
+                # After the testing loop, process results
+                try:
+                    # Check array lengths
+                    array_lengths = {
+                        'sample_indices': len(sample_indices),
+                        'test_energy_scores': len(test_energy_scores),
+                        'test_reconstruction_losses': len(test_reconstruction_losses)
+                    }
+                    if device_ids:
+                        array_lengths['device_ids'] = len(device_ids)
+                    
+                    st.write("Array lengths before alignment:", array_lengths)
+                    
+                    # Find minimum length and truncate arrays
+                    min_length = min(array_lengths.values())
+                    st.write(f"Truncating all arrays to length: {min_length}")
+                    
+                    # Concatenate and reshape arrays
+                    test_energy_scores = np.concatenate(test_energy_scores, axis=0).reshape(-1)[:min_length]
+                    test_reconstruction_losses = np.concatenate(test_reconstruction_losses, axis=0).reshape(-1)[:min_length]
+                    
+                    # Calculate threshold and predictions
+                    threshold = np.percentile(train_energy_scores, (1 - anomaly_ratio) * 100)
+                    predictions = (test_energy_scores > threshold).astype(int)
+                    
+                    # Create results DataFrame with window information
+                    results_data = {
+                        'Sample_Index': sample_indices[:min_length],
+                        'Window_Start': [idx - win_size + 1 for idx in sample_indices[:min_length]],
+                        'Window_End': sample_indices[:min_length],
+                        'Anomaly_Score': test_energy_scores[:min_length],
+                        'Reconstruction_Loss': test_reconstruction_losses[:min_length],
+                        'Predicted_Label': predictions[:min_length]
+                    }
+                    
+                    # Add time information if available
+                    if 'df' in locals() and any(col.lower() in ['timestamp', 'date', 'time'] 
+                                               for col in df.columns):
+                        time_col = next(col for col in df.columns 
+                                       if col.lower() in ['timestamp', 'date', 'time'])
+                        time_values = df[time_col].values
+                        
+                        window_start_times = []
+                        window_end_times = []
+                        
+                        for idx in sample_indices[:min_length]:
+                            start_idx = max(0, idx - win_size + 1)
+                            end_idx = idx
+                            
+                            if start_idx < len(time_values) and end_idx < len(time_values):
+                                window_start_times.append(time_values[start_idx])
+                                window_end_times.append(time_values[end_idx])
+                            else:
+                                window_start_times.append(None)
+                                window_end_times.append(None)
+                        
+                        results_data['Window_Start_Time'] = window_start_times
+                        results_data['Window_End_Time'] = window_end_times
+                    
+                    if device_ids:
+                        results_data['Device_ID'] = device_ids[:min_length]
+                    
+                    results_df = pd.DataFrame(results_data)
+                    
+                    # Process and visualize results
+                    process_and_visualize_results(results_df, df, win_size, features_to_use)
+
+                except Exception as e:
+                    st.error(f"Error processing results: {e}")
+                    st.error(f"Exception details: {str(e.__class__.__name__)}")
+                    return
+
+def process_and_visualize_results(results_df, df, win_size, features_to_use=None):
+    """
+    Process and visualize anomaly detection results
+    
+    Args:
+        results_df (pd.DataFrame): DataFrame containing anomaly detection results
+        df (pd.DataFrame): Original input data
+        win_size (int): Size of the sliding window
+        features_to_use (list): List of features to visualize
+    """
+    st.write("### Detection Results")
+    st.write(f"Total samples: {len(results_df)}")
+    st.write(f"Detected anomalies: {results_df['Predicted_Label'].sum()}")
+    st.write(f"Anomaly ratio: {results_df['Predicted_Label'].mean():.2%}")
+    
+    # Visualize anomaly windows
+    if len(results_df[results_df['Predicted_Label'] == 1]) > 0:
+        st.subheader("Top Anomaly Windows")
+        
+        # Get top 5 anomalies
+        top_anomalies = results_df[results_df['Predicted_Label'] == 1].sort_values(
+            'Anomaly_Score', ascending=False).head(5)
+        
+        for idx, anomaly in top_anomalies.iterrows():
+            st.write(f"#### Anomaly at index {int(anomaly['Sample_Index'])} (Score: {anomaly['Anomaly_Score']:.4f})")
+            
+            start_idx = int(anomaly['Window_Start'])
+            end_idx = int(anomaly['Window_End'])
+            
+            if 'Window_Start_Time' in anomaly:
+                st.write(f"Time range: {anomaly['Window_Start_Time']} to {anomaly['Window_End_Time']}")
+            
+            # Plot window data if available
+            if df is not None and start_idx >= 0 and end_idx < len(df):
+                window_data = df.iloc[start_idx:end_idx+1]
+                
+                # Plot each feature
+                features = features_to_use or df.columns[:min(12, len(df.columns))]
+                for feature in features:
+                    if feature in window_data.columns and pd.api.types.is_numeric_dtype(window_data[feature]):
+                        fig, ax = plt.subplots(figsize=(10, 3))
+                        window_data[feature].plot(ax=ax)
+                        ax.set_title(f"Feature: {feature}")
+                        ax.axvspan(window_data.index[-1] - win_size//4, 
+                                 window_data.index[-1], 
+                                 alpha=0.3, 
+                                 color='red', 
+                                 label='Potential anomaly region')
+                        plt.legend()
+                        st.pyplot(fig)
+                        plt.close(fig)
+        
+        # Create anomaly heatmap
+        if df is not None:
+            create_anomaly_heatmap(results_df, df, win_size)
+        
+        # Export results
+        create_export_button(results_df)
+
+def create_anomaly_heatmap(results_df, df, win_size):
+    """Create and display anomaly heatmap"""
+    st.subheader("Anomaly Heatmap")
+    
+    # Get anomaly indices
+    anomaly_indices = []
+    for idx, anomaly in results_df[results_df['Predicted_Label'] == 1].iterrows():
+        start_idx = int(anomaly['Window_Start'])
+        end_idx = int(anomaly['Window_End'])
+        anomaly_indices.extend(range(start_idx, end_idx+1))
+    
+    # Create boolean mask
+    anomaly_mask = np.zeros(len(df), dtype=bool)
+    valid_indices = [i for i in anomaly_indices if 0 <= i < len(df)]
+    anomaly_mask[valid_indices] = True
+    
+    # Select numeric features
+    numeric_features = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+    
+    if len(numeric_features) > 0:
+        # Normalize data
+        scaler = StandardScaler()
+        normalized_data = scaler.fit_transform(df[numeric_features])
+        
+        # Create heatmap
+        fig, ax = plt.subplots(figsize=(12, 8))
+        sns.heatmap(normalized_data.T, cmap='viridis', robust=True)
+        
+        # Mark anomaly regions
+        for start, end in [(s, min(s+win_size, len(df))) 
+                          for s in set(anomaly_indices) if s < len(df)]:
+            ax.axvspan(start, end, color='red', alpha=0.2)
+        
+        ax.set_xlabel('Time Index')
+        ax.set_ylabel('Features')
+        ax.set_title('Feature Values with Anomaly Regions Highlighted')
+        ax.set_yticks(range(len(numeric_features)))
+        ax.set_yticklabels(numeric_features)
+        
+        st.pyplot(fig)
+        plt.close(fig)
+
+def create_export_button(results_df):
+    """Create download button for anomaly results"""
+    st.subheader("Export Results")
+    
+    anomalies_df = results_df[results_df['Predicted_Label'] == 1].copy()
+    csv = anomalies_df.to_csv(index=False)
+    
+    st.download_button(
+        label="Download Anomaly Results as CSV",
+        data=csv,
+        file_name="anomaly_results.csv",
+        mime="text/csv",
+    )
 
 if __name__ == "__main__":
     main()
