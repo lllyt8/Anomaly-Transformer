@@ -6,7 +6,7 @@ import numpy as np
 from datetime import datetime
 
 class LLMAnomalyAnalyzer:
-    """Class to analyze anomalies using an LLM API (Deepseek or similar)"""
+    """Class to analyze anomalies using an LLM API (DeepSeek or similar)"""
     
     def __init__(self, api_key=None, api_url=None):
         """
