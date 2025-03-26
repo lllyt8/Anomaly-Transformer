@@ -129,4 +129,5 @@ dmypy.json
 .pyre/
 
 # Testing result
-nixtla_results/
+/nixtla_results/
+/archive/
